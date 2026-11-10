@@ -1,5 +1,6 @@
+import uuid
 import jwt
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Header, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -81,7 +82,52 @@ async def get_current_client_user(
     return user
 
 
-# --- 3. GENERIC USER RESOLVER (Optional fallback) ---
+# --- 3. ACTIVE BRANCH RESOLVER ---
+async def get_active_branch_id(
+    x_branch_id: str | None = Header(None, alias="X-Branch-ID"),
+    current_user: User = Depends(get_current_client_user),
+    db: AsyncSession = Depends(get_db)
+) -> uuid.UUID:
+    from models.internal_salon import Branch
+    from models.client import StaffProfile
+
+    # 1. If explicit header provided, verify it belongs to user's salon
+    if x_branch_id:
+        try:
+            branch_uuid = uuid.UUID(x_branch_id)
+            result = await db.execute(select(Branch).where(Branch.id == branch_uuid))
+            branch = result.scalar_one_or_none()
+            if branch and (current_user.salon_id is None or branch.salon_id == current_user.salon_id):
+                return branch.id
+        except ValueError:
+            pass
+
+    # 2. Check user's direct shop_id
+    if current_user.shop_id:
+        return current_user.shop_id
+
+    # 3. Check if user is linked to a StaffProfile
+    staff_res = await db.execute(select(StaffProfile).where(StaffProfile.user_id == current_user.id))
+    staff = staff_res.scalar_one_or_none()
+    if staff and staff.branch_id:
+        return staff.branch_id
+
+    # 4. If salon admin, grab the first active branch of the salon
+    if current_user.salon_id:
+        branch_res = await db.execute(
+            select(Branch).where(Branch.salon_id == current_user.salon_id, Branch.is_active == True)
+        )
+        first_branch = branch_res.scalars().first()
+        if first_branch:
+            return first_branch.id
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="No active branch found or assigned for this account. Please specify X-Branch-ID header."
+    )
+
+
+# --- 4. GENERIC USER RESOLVER ---
 async def get_current_user(
     payload: dict = Depends(decode_token_payload),
     db: AsyncSession = Depends(get_db)
